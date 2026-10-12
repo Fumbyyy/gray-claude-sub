@@ -8,11 +8,12 @@ fn body(items: Vec<Value>) -> Value {
 fn user_message_becomes_native_frame() {
     let b = body(vec![json!({"type": "message", "role": "user",
         "content": [{"type": "input_text", "text": "hi"}]})]);
-    let turn = prepare_turn(&b, "sonnet").unwrap();
+    let turn = prepare_turn(&b, "some-future-model").unwrap();
     assert_eq!(turn.system, "sys");
     assert_eq!(turn.frames.len(), 1);
     assert_eq!(turn.frames[0]["type"], "user");
-    assert_eq!(turn.native_model, "claude-sonnet-5[1m]");
+    // An id no catalog lists passes through untouched, whatever is cached.
+    assert_eq!(turn.native_model, "some-future-model");
 }
 
 #[test]

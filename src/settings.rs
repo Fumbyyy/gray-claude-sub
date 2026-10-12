@@ -85,10 +85,16 @@ impl ToolPolicy {
     }
 }
 
+/// `<gray home>/claude-sub/` — the plugin's state directory. The model cache
+/// lives beside `tools.json` (see [`crate::catalog`]).
+pub(crate) fn state_dir() -> Option<PathBuf> {
+    gray_core::paths::gray_home().map(|h| h.join("claude-sub"))
+}
+
 /// `<gray home>/claude-sub/tools.json` — the same GRAY_HOME rule the host
 /// uses (`gray_core::paths`), so a repo-local GRAY_HOME scopes the policy.
 fn file_path() -> Option<PathBuf> {
-    gray_core::paths::gray_home().map(|h| h.join("claude-sub").join("tools.json"))
+    state_dir().map(|d| d.join("tools.json"))
 }
 
 /// Tool names are ASCII identifiers the host's schema already constrains;

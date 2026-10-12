@@ -3,8 +3,8 @@
 //! (NousResearch/hermes-plugin-claude-subscription-directsdk, MIT).
 //!
 //! Both probes are offline with respect to Anthropic: `auth status` reads
-//! the local credential store. Anything unexpected degrades to the pinned
-//! catalog rather than failing setup.
+//! the local credential store. Anything unexpected degrades to `Unknown`
+//! rather than failing setup.
 
 use std::path::PathBuf;
 
@@ -16,7 +16,7 @@ pub const INSTALL_HINT: &str = "`claude` not found on PATH. Install it with \
 pub const LOGIN_HINT: &str =
     "Claude Code is installed but not logged in. Run `claude auth login` and retry.";
 
-/// Login state. `Unknown` degrades to the pinned catalog, never to a turn.
+/// Login state. `Unknown` never blocks a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginState {
     LoggedIn,

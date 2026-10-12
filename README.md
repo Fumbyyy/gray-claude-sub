@@ -16,10 +16,10 @@
 
 ## Highlights
 
-* **Zero Token / Credential Leaks**: Uses your existing official Claude Code login (`claude auth login`). Never handles, stores, or logs API keys or tokens.
+* **No Credential Reads**: The plugin never opens your Claude credential file or reads your OAuth token. Model discovery is a plain GET of Anthropic's public models page, with no login. Chat and usage run the official `claude` CLI, which uses your own `claude auth login`. The only bearer the plugin creates is a per-turn token for its own loopback relay.
 * **Single-Request Admission Relay**: Drives an internal request-scoped loopback admission relay that enforces exactly one provider request per turn and absorbs redundant recovery attempts.
 * **Native Assistant Replay Carrier**: Assistant messages round-trip in signed reasoning replay carriers (`NATIVE_ITEM_ID`) so future turns restore byte-identical provider frames without prompt divergence.
-* **Pinned Model Catalog**: Exact context windows without guessing (`opus`, `sonnet`, `fable`: 1,000,000 tokens; `haiku`: 200,000 tokens).
+* **Model Catalog**: Routes and context windows come from Anthropic's public models page, cached on disk. Nothing is compiled in.
 
 ---
 
@@ -85,14 +85,11 @@ Once registered, Claude subscription models appear under the `claude-sub/` prefi
 gray -m claude-sub/sonnet -p "Review this codebase"
 ```
 
-### Pinned Model Catalog
+### Model Catalog
 
-| Model ID | Target Model | Context Window |
-|---|---|---|
-| `claude-sub/sonnet` | Claude 3.7 Sonnet | 1,000,000 tokens |
-| `claude-sub/opus` | Claude 3.5 Opus | 1,000,000 tokens |
-| `claude-sub/haiku` | Claude 3.5 Haiku | 200,000 tokens |
-| `claude-sub/fable` | Claude 3.7 Sonnet (Fable) | 1,000,000 tokens |
+Routes and context windows come from Anthropic's public models page, `https://platform.claude.com/docs/en/models/overview.md`, read with no credentials. Each successful parse is cached in `$GRAY_HOME/claude-sub/models-cache.json` (default `~/.gray/claude-sub/models-cache.json`) and answers when the page can't be fetched or parsed. With no cache, the model list says why it can't be listed.
+
+The page gives no context window for legacy models, so they get no `[1m]` route. It states no effort levels, so no model offers reasoning-effort levels. Set `CLAUDE_SUB_MODELS_URL` to read the page from another URL.
 
 ---
 
@@ -109,7 +106,7 @@ gray -m claude-sub/sonnet -p "Review this codebase"
 
 The sidecar communicates over standard I/O using newline-delimited JSON (NDJSON):
 * `plugin/manifest`: Declares provider capabilities and supported model IDs.
-* `provider/models`: Returns the pinned catalog.
+* `provider/models`: Returns the catalog from the public models page, or the cached one.
 * `provider/chat`: Parks the request intent and initiates a relayed turn.
 * `provider/auth/*`: Reports external CLI authentication state.
 
@@ -122,8 +119,8 @@ The sidecar communicates over standard I/O using newline-delimited JSON (NDJSON)
 │   ├── main.rs              # Protocol-1.2 sidecar entry point
 │   ├── chat.rs              # Request translation, streaming parser, and CLI runner
 │   ├── relay.rs             # Single-admission loopback relay proxy
-│   ├── catalog.rs           # Pinned model catalog definitions
-│   ├── models.rs            # Provider model metadata
+│   ├── catalog.rs           # Model catalog and disk cache
+│   ├── models.rs            # Public models-page fetch and parser
 │   ├── manifest.rs          # Plugin protocol manifest
 │   ├── setup.rs             # CLI dependency discovery and verification
 └── reference/               # DirectSDK test & eval suite

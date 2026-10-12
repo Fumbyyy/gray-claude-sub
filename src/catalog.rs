@@ -1,110 +1,129 @@
-//! Native route catalog: live `/v1/models` discovery with a pinned
-//! fallback. Port of the Hermes DirectSDK `model_catalog.py`
-//! (NousResearch/hermes-plugin-claude-subscription-directsdk, MIT).
+//! Native route catalog: the models Anthropic's public models page lists,
+//! with the last successful parse cached on disk. Port of the Hermes
+//! DirectSDK `model_catalog.py` (NousResearch/hermes-plugin-claude-subscription-directsdk, MIT).
 //!
 //! A loopback gateway needs explicit long-context selection: native runs a
 //! plain id inside its 200K default and selects 1M only for an explicit
-//! `[1m]` route. Routable ids, windows, display names, families and effort
-//! support come from `GET /v1/models` on the user's OAuth login — nothing
-//! per-release is hardcoded. When the fetch can't run (no credential,
-//! offline) the last-known-good table below answers instead: stale beats
-//! dead, and unknown ids still pass through at the 200K native default
-//! rather than being guessed up to 1M.
+//! `[1m]` route. Routable ids and their windows come from the public page
+//! ([`crate::models`]): nothing per-release is compiled in, and no credential
+//! is read or sent. Each successful parse is cached at
+//! `<gray home>/claude-sub/models-cache.json`, and that cache answers when a
+//! fetch or parse fails. With no cache the catalog is empty: nothing is
+//! invented, and unknown ids pass through to native.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
-/// One model as `/v1/models` reports it (fields we use; everything else is
-/// ignored). A `None` field means the API didn't say — callers fall back
-/// to the pinned table, then to defaults.
-#[derive(Debug, Clone, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+/// One model the models page lists: its API id and context window. A `None`
+/// window means the page doesn't state one, so no `[1m]` route is offered.
+/// The same shape is the disk cache's entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
-    /// `display_name` upstream ("Claude Sonnet 5.5"); derived when absent.
-    pub display_name: Option<String>,
-    /// `created_at` upstream (RFC 3339): the sort key for "newest of a
-    /// family" — ordering only, the value is never shown.
-    pub created_at: String,
-    /// `line` upstream ("sonnet"): the family a bare alias resolves to.
-    /// Absent → derived from the id (`claude-<family>-…`).
-    pub line: Option<String>,
-    /// `max_input_tokens` upstream: the real window, 1M included.
-    pub max_input_tokens: Option<u32>,
-    /// Effort levels the API marks supported, in canonical order.
-    /// `None` = unknown → the renderer lists every effort (status quo).
-    pub efforts: Option<Vec<String>>,
+    /// Context window in tokens, from the page's `Context window` row.
+    #[serde(default)]
+    pub window: Option<u32>,
+    /// Prompt tokens above which this model bills a higher price tier, from
+    /// the pricing page's `(for prompts over N tokens)` rows. `None` = the
+    /// provider declares no cliff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_cliff: Option<u32>,
 }
 
-/// A resolved view of the catalog: fetched or fallback. `models` is kept
-/// sorted newest-first so "first match" picks are always the newest
-/// release of a family or prefix.
+/// A resolved view of the catalog: parsed, cached or empty. `models` keeps the
+/// page's order (current models in table order, then legacy as listed), so a
+/// "first match" pick is the newest release of a family or prefix.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub models: Vec<ModelInfo>,
 }
 
 impl Snapshot {
-    pub(crate) fn new(mut models: Vec<ModelInfo>) -> Self {
-        // Newest first; `created_at` is RFC 3339 so lexical = chronological.
-        // `id` descending breaks ties deterministically.
-        models.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then_with(|| b.id.cmp(&a.id))
-        });
+    pub(crate) fn new(models: Vec<ModelInfo>) -> Self {
         Self { models }
     }
 
-    fn by_id(&self, id: &str) -> Option<&ModelInfo> {
+    pub(crate) fn by_id(&self, id: &str) -> Option<&ModelInfo> {
         self.models.iter().find(|m| m.id == id)
     }
 }
 
-/// Effort levels native `--effort` accepts, in order (gray's `off` = flag
-/// omitted). Also the report when the API omits per-model effort support.
-pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+/// The cache's file name under `<gray home>/claude-sub/`.
+const CACHE_FILE: &str = "models-cache.json";
 
-/// Last-known-good routes, consulted only when live discovery hasn't run
-/// or a fetched entry omits a fact. `created` is a family-ordering hint
-/// (matches upstream `created_at` at pin time); `window` doubles as the
-/// `[1m]`-route marker: 1M means the route exists, 200K means none.
-const FALLBACK: &[(&str, &str, u32, &str)] = &[
-    // (id, family, window, created ordering hint)
-    ("claude-sonnet-5", "sonnet", 1_000_000, "2026-06-29"),
-    ("claude-haiku-4-5-20251001", "haiku", 200_000, "2025-10-15"),
-    ("claude-opus-5-5", "opus", 1_000_000, "2026-09-21"),
-    ("claude-opus-5", "opus", 1_000_000, "2026-07-24"),
-    ("claude-opus-4-8", "opus", 1_000_000, "2026-05-28"),
-    ("claude-fable-5-1", "fable", 1_000_000, "2026-08-28"),
-];
-
-fn fallback_snapshot() -> Snapshot {
-    Snapshot::new(
-        FALLBACK
-            .iter()
-            .map(|(id, line, window, created)| ModelInfo {
-                id: id.to_string(),
-                display_name: None,
-                created_at: created.to_string(),
-                line: Some(line.to_string()),
-                max_input_tokens: Some(*window),
-                efforts: None,
-            })
-            .collect(),
-    )
+/// Where the disk cache lives. `None` when no gray home resolves, which
+/// means there is no cache at all.
+fn cache_path() -> Option<PathBuf> {
+    crate::settings::state_dir().map(|dir| dir.join(CACHE_FILE))
 }
 
-/// The snapshot everyone reads: fallback until the first successful fetch
-/// swaps in live data. Written once per process under [`FETCH_LOCK`].
+/// The cache's on-disk shape: the models of the last successful parse.
+#[derive(Serialize, Deserialize)]
+struct CacheFile {
+    #[serde(default)]
+    models: Vec<ModelInfo>,
+}
+
+/// The cached list, or `None` when the file is missing, unreadable, or
+/// holds no routes. Never fetches.
+fn load_cache_at(path: &Path) -> Option<Snapshot> {
+    let file: CacheFile = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let models: Vec<ModelInfo> = file
+        .models
+        .into_iter()
+        .filter(|m| !m.id.is_empty())
+        .collect();
+    (!models.is_empty()).then(|| Snapshot::new(models))
+}
+
+/// Persist a successful parse. The body goes to a sibling temp file, is
+/// synced, then renamed over the cache: a reader sees the old file or the
+/// new one, never a torn write. Best-effort: a failure only costs the next
+/// cold start its cache.
+fn write_cache_at(path: &Path, models: &[ModelInfo]) -> std::io::Result<()> {
+    let body = serde_json::to_vec(&CacheFile {
+        models: models.to_vec(),
+    })?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let written = std::fs::File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(&body)?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// The catalog before any fetch: the cache if it reads, else empty.
+fn initial_snapshot_from(path: Option<&Path>) -> Snapshot {
+    path.and_then(load_cache_at)
+        .unwrap_or_else(|| Snapshot::new(Vec::new()))
+}
+
+/// The snapshot everyone reads: the cache (or empty) until the first
+/// successful fetch swaps in live data. Written once per process under
+/// [`FETCH_LOCK`].
 static SNAPSHOT: LazyLock<RwLock<Arc<Snapshot>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(fallback_snapshot())));
+    LazyLock::new(|| RwLock::new(Arc::new(initial_snapshot_from(cache_path().as_deref()))));
 /// Set once live data is installed; failures leave it clear so a later
 /// `provider/models` retries (transient errors heal).
 static FETCHED: AtomicBool = AtomicBool::new(false);
 static FETCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Whatever the catalog currently knows — never blocks on the network.
-/// This is the fallback until the first [`snapshot`] call succeeds.
+/// Until the first successful [`snapshot`] that is the cache, or empty.
 pub fn current() -> Arc<Snapshot> {
     SNAPSHOT.read().unwrap().clone()
 }
@@ -116,31 +135,42 @@ pub fn install(s: Arc<Snapshot>) {
     FETCHED.store(true, Ordering::Relaxed);
 }
 
-/// Live-or-fallback snapshot: fetch once per process (OAuth bearer from
-/// the Claude credential file), keep the last good answer on failure.
-pub async fn snapshot() -> Arc<Snapshot> {
+/// The live catalog for a caller that needs routes: fetch once per process,
+/// then install and cache what comes back. A failed fetch or parse keeps what
+/// is known and errs, with the reason, only when there is nothing to show.
+pub async fn snapshot() -> Result<Arc<Snapshot>, String> {
     if FETCHED.load(Ordering::Relaxed) {
-        return current();
+        return Ok(current());
     }
     let _guard = FETCH_LOCK.lock().await;
     if FETCHED.load(Ordering::Relaxed) {
-        return current();
+        return Ok(current());
     }
     match crate::models::fetch_snapshot().await {
         Ok(s) => {
             install(s.clone());
-            s
+            if let Some(path) = cache_path() {
+                // Best-effort: the parsed list is already in place.
+                let _ = write_cache_at(&path, &s.models);
+            }
+            Ok(s)
         }
-        Err(_) => current(),
+        Err(why) => settle_failed_fetch(current(), why),
     }
 }
 
-/// The family an id belongs to: the API's `line`, else the first segment
-/// after `claude-` (`claude-sonnet-5-5` → `sonnet`).
-pub(crate) fn family(m: &ModelInfo) -> &str {
-    if let Some(line) = &m.line {
-        return line;
+/// A failed fetch: what is already known (the cache) still answers. With
+/// nothing known, the failure itself is the answer.
+fn settle_failed_fetch(known: Arc<Snapshot>, why: String) -> Result<Arc<Snapshot>, String> {
+    if known.models.is_empty() {
+        Err(why)
+    } else {
+        Ok(known)
     }
+}
+
+/// The family an id belongs to: the word after `claude-` in `claude-<family>-…`.
+pub(crate) fn family(m: &ModelInfo) -> &str {
     m.id.strip_prefix("claude-")
         .and_then(|rest| rest.split('-').next())
         .unwrap_or(&m.id)
@@ -153,13 +183,13 @@ fn canonical_in<'a>(model: &'a str, s: &'a Snapshot) -> &'a str {
     resolve(base, s).unwrap_or(base)
 }
 
-/// One resolution pass: exact id, then family alias ("sonnet" → newest
-/// sonnet; "claude-sonnet" counts too), then a `claude-`-less or dated
-/// prefix ("claude-haiku-4-5" → its dated id), newest match winning.
-/// Last: a dated tail variant of a known id — `claude-opus-5-5-20260101`
-/// strips its all-digit date segment and resolves the stem, so a dated
-/// id inherits its family's window and routes instead of falling to the
-/// 200K default.
+/// One resolution pass; the first match in list order wins. Exact id, then a
+/// family alias (a bare family name, or `claude-<family>`, picks the family's
+/// first listed id), then a prefix on a hyphen boundary (`claude-<x>` picks
+/// the first id that continues `claude-<x>-…`). Last: a dated tail variant of
+/// a known id. A tail of eight or more digits (a date) is stripped and the
+/// stem resolved, so a dated id inherits its window and routes instead of
+/// falling to the 200K default.
 fn resolve<'a>(base: &'a str, s: &'a Snapshot) -> Option<&'a str> {
     if s.by_id(base).is_some() {
         return Some(base);
@@ -168,8 +198,7 @@ fn resolve<'a>(base: &'a str, s: &'a Snapshot) -> Option<&'a str> {
     if let Some(m) = s.models.iter().find(|m| family(m) == name) {
         return Some(&m.id);
     }
-    // Prefix on a hyphen boundary: "claude-opus-4" → newest claude-opus-4-*.
-    // models is newest-first, so the first match is the newest.
+    // Prefix on a hyphen boundary: `claude-<x>` → the first id `claude-<x>-…`.
     if let Some(m) = s.models.iter().find(|m| {
         m.id.len() > base.len() && m.id.starts_with(base) && m.id.as_bytes()[base.len()] == b'-'
     }) {
@@ -184,29 +213,15 @@ fn resolve<'a>(base: &'a str, s: &'a Snapshot) -> Option<&'a str> {
     None
 }
 
-/// The window a snapshot assigns an id: fetched `max_input_tokens`, else
-/// the pinned table entry for a known id, else `None` (unknown).
-fn window_of(m: &ModelInfo) -> Option<u32> {
-    m.max_input_tokens.or_else(|| {
-        FALLBACK
-            .iter()
-            .find(|(id, ..)| *id == m.id)
-            .map(|(_, _, w, _)| *w)
-    })
-}
-
+/// The window the snapshot reports for an id: the page's window for a known
+/// id. `None` when the id is unknown or the page didn't state one.
 fn known_window(id: &str, s: &Snapshot) -> Option<u32> {
-    s.by_id(id).and_then(window_of).or_else(|| {
-        FALLBACK
-            .iter()
-            .find(|(fid, ..)| *fid == id)
-            .map(|(_, _, w, _)| *w)
-    })
+    s.by_id(id).and_then(|m| m.window)
 }
 
-/// Context window for a route: fetched/pinned window for a known id, the
-/// 200K native default for an unknown plain id, `None` for an unknown
-/// `[1m]` route (no guess exceeds the 1M native budget).
+/// Context window for a route: the page's window for a known id. A plain id
+/// without one runs at native's 200K default, so that is its window; a `[1m]`
+/// route without one has no window (`None`): no guess reaches the 1M budget.
 pub fn context_window_in(model: &str, s: &Snapshot) -> Option<u32> {
     let canon = canonical_in(model, s);
     if let Some(w) = known_window(canon, s) {
@@ -220,6 +235,17 @@ pub fn context_window_in(model: &str, s: &Snapshot) -> Option<u32> {
 
 pub fn context_window(model: &str) -> Option<u32> {
     context_window_in(model, &current())
+}
+
+/// The declared price cliff for a route, resolved through canonical ids like
+/// [`context_window_in`]. `None` when the provider declares none — no
+/// default: the host must never guess a cliff.
+pub fn price_cliff_in(model: &str, s: &Snapshot) -> Option<u32> {
+    s.by_id(canonical_in(model, s)).and_then(|m| m.price_cliff)
+}
+
+pub fn price_cliff(model: &str) -> Option<u32> {
+    price_cliff_in(model, &current())
 }
 
 /// Native `--model` selection: ids with a 1M window get `[1m]`, 200K ids
@@ -249,7 +275,7 @@ pub fn all_ids_in(s: &Snapshot) -> Vec<String> {
     let mut families: Vec<&str> = Vec::new();
     for m in &s.models {
         out.push(m.id.clone());
-        if window_of(m) == Some(1_000_000) {
+        if m.window == Some(1_000_000) {
             out.push(format!("{}[1m]", m.id));
         }
         let f = family(m);
@@ -267,9 +293,9 @@ pub fn all_ids() -> Vec<String> {
     all_ids_in(&current())
 }
 
-/// Derive a name from an id (`claude-opus-5-5` → `Claude Opus 5.5`):
-/// a lone digit folds onto a digit-ending word (`haiku-4-5-20251001`
-/// keeps its date — six-plus digits never merge).
+/// Derive a name from an id (`claude-<family>-<major>-<minor>` →
+/// `Claude <Family> <major>.<minor>`): a one-digit segment folds onto a
+/// digit-ending word; a longer digit run (a date) stays a word of its own.
 fn derive_name(base: &str) -> String {
     let short = base.strip_prefix("claude-").unwrap_or(base);
     let mut words: Vec<String> = Vec::new();
@@ -293,16 +319,15 @@ fn derive_name(base: &str) -> String {
     format!("Claude {}", words.join(" "))
 }
 
-/// Display name for a route id: the API's `display_name` for a fetched
-/// id, else derived from the canonical id. `[1m]` routes get a suffix.
+/// Display name for a route, derived from its canonical id. `[1m]` routes
+/// get a suffix.
 pub fn display_name_in(id: &str, s: &Snapshot) -> String {
-    let long = id.ends_with("[1m]");
-    let canon = canonical_in(id, s);
-    let name = s
-        .by_id(canon)
-        .and_then(|m| m.display_name.clone())
-        .unwrap_or_else(|| derive_name(canon));
-    if long { format!("{name} 1M") } else { name }
+    let name = derive_name(canonical_in(id, s));
+    if id.ends_with("[1m]") {
+        format!("{name} 1M")
+    } else {
+        name
+    }
 }
 
 pub fn display_name(id: &str) -> String {
