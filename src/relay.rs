@@ -279,9 +279,25 @@ fn write_sse_head(s: &mut std::net::TcpStream) -> bool {
 /// host's turn-level retry re-enters through `provider/chat` → a fresh
 /// relay. Caller writes the head first if the stream isn't open yet.
 fn write_sse_failure(s: &mut std::net::TcpStream, detail: &str) {
+    // Quota-window rejections ride a typed code: a host that classifies on
+    // `code` alone marks the turn exhausted (terminal) instead of stream-
+    // retrying it — a retried quota request re-bills the whole prompt for
+    // nothing. Other upstream verdicts keep their real status so hosts
+    // can tell a 429 throttle from a dead wire.
+    let code = match crate::chat::api_error(detail) {
+        Some((429, text))
+            if ["usage limit", "session limit", "resets in", "resets at"]
+                .iter()
+                .any(|h| text.to_lowercase().contains(h)) =>
+        {
+            "insufficient_quota".to_string()
+        }
+        Some((status, _)) => status.to_string(),
+        None => "server_error".to_string(),
+    };
     let failed = json!({"type": "response.failed",
         "response": {"status": "failed",
-            "error": {"code": "server_error", "message": detail}}});
+            "error": {"code": code, "message": detail}}});
     let _ = s
         .write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes())
         .and_then(|_| s.flush());

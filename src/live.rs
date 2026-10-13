@@ -308,6 +308,56 @@ fn assistant_side(item: &Value) -> bool {
     }
 }
 
+/// An identical re-issue of the input this session already absorbed — a
+/// whole-turn retry after a judged failure. Reuse the live child: the
+/// upstream session keeps its cache where a cold spawn re-bills the
+/// whole transcript.
+///
+/// Returns where the resend starts (everything after the last assistant-
+/// side item — the user-side delta the previous attempt already sent)
+/// plus `undelivered` (a recorded reply that never echoed back means the
+/// host lost it). `Err("stale")` when nothing is in flight and the tail
+/// holds no user frame to re-ask: the consumed reply can't be re-asked
+/// without inventing a delta, so the turn cold-starts as before.
+fn retry_delta(
+    running: usize,
+    parked: usize,
+    reply_call_ids: &[String],
+    reply_text: &str,
+    input: &[Value],
+) -> Result<(usize, bool), &'static str> {
+    let undelivered = !reply_call_ids.is_empty() || !reply_text.trim().is_empty();
+    let cut = input.iter().rposition(assistant_side).map_or(0, |i| i + 1);
+    let has_user = input[cut..].iter().any(|item| {
+        chat::item_kind(item) == "message"
+            && item.get("role").and_then(Value::as_str) == Some("user")
+    });
+    if parked > 0 {
+        // Only outputs unblock a parked front: the tail's answer them
+        // (already-delivered ones skip silently) and the query resumes.
+        // Without any there is nothing to send — a deferred user frame
+        // would still wait on the parked front and stall the drain.
+        let has_output = input[cut..]
+            .iter()
+            .any(|item| chat::item_kind(item) == "function_call_output");
+        return if has_output {
+            Ok((cut, undelivered))
+        } else {
+            Err("stale")
+        };
+    }
+    if running > 0 {
+        // The delta's query is still in flight upstream — resending a
+        // user frame mid-query wedges the child, so just drain it.
+        return Ok((input.len(), undelivered));
+    }
+    if has_user {
+        // Idle child, turn judged failed: re-ask the last user frame.
+        return Ok((cut, undelivered));
+    }
+    Err("stale")
+}
+
 /// The first pooled session this turn is a strict continuation of, or
 /// the deepest reason any candidate reached (`no_session` when empty).
 fn find(
@@ -324,6 +374,17 @@ fn find(
             ("system", 2)
         } else if s.effort.as_deref() != effort {
             ("effort", 3)
+        } else if s.absorbed == turn.input {
+            match retry_delta(
+                s.running,
+                s.bridge.unanswered_ids().len(),
+                &s.reply_call_ids,
+                &s.reply_text,
+                &turn.input,
+            ) {
+                Ok((delta_at, undelivered)) => return Ok((i, delta_at, undelivered)),
+                Err(m) => (m, 6),
+            }
         } else {
             match continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input) {
                 Ok((tail, undelivered)) => {
@@ -1737,7 +1798,9 @@ fn finish_spawn(
                 } else {
                     // Settled upstream failure on a fresh child: the input
                     // counts as absorbed so this conversation owns the
-                    // session, but an identical retry respawns by design.
+                    // session, and an identical retry reuses it — `retry_delta`
+                    // re-asks the last delta instead of cold-replaying the
+                    // transcript on a new child.
                     if chat::api_error(&e).is_some_and(|(c, _)| c == 429) {
                         s.rate_limited = true;
                     }
@@ -1812,4 +1875,67 @@ mod tests {
             Err("echo")
         );
     }
+
+    fn user_msg(text: &str) -> Value {
+        json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]})
+    }
+
+    fn assistant_msg(text: &str) -> Value {
+        json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]})
+    }
+
+    #[test]
+    fn retry_delta_idle_child_reasks_the_last_user_frame() {
+        // Whole-turn retry of a failed turn: absorbed == input, the child
+        // is idle — the resend is the user delta after the last
+        // assistant-side item.
+        let input = vec![
+            user_msg("hi"),
+            assistant_msg("a"),
+            user_msg("do the thing"),
+        ];
+        let (delta_at, undelivered) = retry_delta(0, 0, &[], "", &input).unwrap();
+        assert_eq!(delta_at, 2, "the last user frame re-asks");
+        assert!(!undelivered);
+    }
+
+    #[test]
+    fn retry_delta_flags_an_undelivered_reply() {
+        let input = vec![user_msg("hi"), assistant_msg("a"), user_msg("go")];
+        let (_, undelivered) =
+            retry_delta(0, 0, &["c1".to_string()], "answer text", &input).unwrap();
+        assert!(undelivered, "a recorded reply the host never echoed is lost");
+    }
+
+    #[test]
+    fn retry_delta_mid_query_drains_instead_of_resending() {
+        // running > 0: the absorbed delta is still being answered —
+        // resending a user frame mid-query wedges the child.
+        let input = vec![user_msg("hi"), assistant_msg("a"), user_msg("go")];
+        let (delta_at, _) = retry_delta(1, 0, &[], "", &input).unwrap();
+        assert_eq!(delta_at, input.len(), "nothing resent; the drain answers");
+    }
+
+    #[test]
+    fn retry_delta_parked_calls_get_their_outputs() {
+        let input = vec![
+            user_msg("hi"),
+            assistant_msg("a"),
+            json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+            user_msg("and?"),
+        ];
+        let (delta_at, _) = retry_delta(0, 1, &[], "", &input).unwrap();
+        assert_eq!(delta_at, 2, "outputs route to the parked calls first");
+    }
+
+    #[test]
+    fn retry_delta_nothing_to_send_cold_starts() {
+        // Idle child and the absorbed tail has no user frame — the
+        // consumed reply can't be re-asked without inventing a delta.
+        let input = vec![user_msg("hi"), assistant_msg("a")];
+        assert_eq!(retry_delta(0, 0, &[], "", &input), Err("stale"));
+    }
+
 }
