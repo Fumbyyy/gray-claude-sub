@@ -245,7 +245,7 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
     // One live native session per conversation: a continuing request
     // writes only its delta into the pooled child; tool calls park inside
     // the child's `gray` MCP server until a later turn answers them.
-    let lines = crate::live::run_turn(&body, &intent.model, effort, Duration::from_secs(300))?;
+    let lines = crate::live::run_turn(&body, &intent.model, effort, crate::live::turn_cap())?;
     // The fold's inventory is the advertised set, not the raw request:
     // `/claude tools` narrows what the model may call upstream.
     let policy = crate::settings::ToolPolicy::load();

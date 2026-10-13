@@ -63,9 +63,35 @@ const DRAIN_STEP: Duration = Duration::from_millis(100);
 /// event carrying a parked call's `tool_use` can still be inside the
 /// stdout pump when the socket request lands.
 const CALLS_GRACE: Duration = Duration::from_millis(150);
+/// A drain dies when the child emits nothing for this long —
+/// `GRAY_CLAUDE_IDLE_SECS` overrides. A slow reply keeps resetting it;
+/// a hung child doesn't stretch it.
+const IDLE_WINDOW: Duration = Duration::from_secs(180);
+/// Absolute per-turn cap regardless of activity —
+/// `GRAY_CLAUDE_MAX_SECS` overrides.
+const MAX_TURN: Duration = Duration::from_secs(60 * 60);
 /// A delta's `function_call_output` answering nothing this session parked
 /// or answered means the history belongs to another conversation.
 const NOTE_UNDELIVERED: &str = "[Harness note] Your previous reply was interrupted by the user and never delivered; none of its tool calls ran.";
+
+fn env_secs(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(default)
+}
+
+/// Per-drain no-activity window.
+fn idle_window() -> Duration {
+    env_secs("GRAY_CLAUDE_IDLE_SECS", IDLE_WINDOW)
+}
+
+/// Absolute per-turn cap; the relay passes it to [`run_turn`].
+pub(crate) fn turn_cap() -> Duration {
+    env_secs("GRAY_CLAUDE_MAX_SECS", MAX_TURN)
+}
 /// Parked calls the host never produced results for (reply undelivered,
 /// or a call dropped between turns) get this error so the query unblocks.
 const NOTE_SUPERSEDED: &str = "the harness did not return a result for this call (superseded)";
@@ -157,6 +183,9 @@ pub struct LiveSession {
     rewarmed: bool,
     /// Frames written this turn, for the `CLAUDE_SUB_DEBUG` dump.
     sent: Vec<Value>,
+    /// No-activity window before a drain gives up; stream progress
+    /// resets it. `deadline` remains the absolute cap.
+    idle: Duration,
 }
 
 /// Enough of a checked-out session to guess whether a turn could use it:
@@ -944,6 +973,11 @@ impl LiveSession {
         // don't decrement `running` again.
         let mut parked: HashSet<String> = self.bridge.unanswered_ids();
         let mut front_parked = !parked.is_empty();
+        // Progress clock: any state movement (a folded line, a settled
+        // or parked call, bridge traffic) resets it, so a slow reply
+        // keeps its window while a hung child dies at `idle`.
+        let mut last_progress = Instant::now();
+        let mut sig = (0usize, 0usize, 0usize, 0usize);
         loop {
             if let Some(e) = self.collect_pending(
                 &mut lines,
@@ -953,6 +987,16 @@ impl LiveSession {
                 &mut front_parked,
             ) {
                 return Err(e);
+            }
+            let now_sig = (
+                lines.len(),
+                self.running,
+                parked.len(),
+                self.bridge.unanswered_ids().len(),
+            );
+            if now_sig != sig {
+                sig = now_sig;
+                last_progress = Instant::now();
             }
             if self.running == 0 && self.bridge.unanswered_ids().is_empty() {
                 // Nothing in flight, nothing parked: turn boundary.
@@ -983,6 +1027,15 @@ impl LiveSession {
             }
             if Instant::now() >= deadline {
                 return Err("Claude request timed out".into());
+            }
+            // The idle cutoff only counts while the child owes stream
+            // output — a drain waiting on parked or host-answered tool
+            // calls is on the host's clock, not the child's.
+            if parked.is_empty()
+                && self.bridge.unanswered_ids().is_empty()
+                && Instant::now() >= last_progress + self.idle
+            {
+                return Err(format!("Claude request idle {}s", self.idle.as_secs()));
             }
             if self.bridge.is_dead() && !self.tools.is_empty() {
                 // No transport, no tool answers: this query can only hang.
@@ -1276,6 +1329,7 @@ fn spawn_child(
         pid,
         sent: Vec::new(),
         rewarmed: false,
+        idle: idle_window(),
     })
 }
 
