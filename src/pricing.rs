@@ -35,7 +35,7 @@ pub async fn fetch_pricing(url: &str) -> Result<String, String> {
 /// page's own display names, so the page stays the only source of truth; a
 /// name matching nothing is dropped. `prior` keeps last-known cliffs when
 /// this run had no usable pricing page — cached data, not a guess.
-pub fn annotate(models: &mut Vec<ModelInfo>, page: Option<&str>, prior: &Snapshot) {
+pub fn annotate(models: &mut [ModelInfo], page: Option<&str>, prior: &Snapshot) {
     let cliffs = page.and_then(cliff_rows).unwrap_or_default();
     if cliffs.is_empty() {
         // No usable pricing page this run: last-known cliffs stand (same
@@ -48,7 +48,7 @@ pub fn annotate(models: &mut Vec<ModelInfo>, page: Option<&str>, prior: &Snapsho
         }
         return;
     }
-    let names = Snapshot::new(models.clone());
+    let names = Snapshot::new(models.to_vec());
     for m in models.iter_mut() {
         if m.price_cliff.is_some() {
             continue;

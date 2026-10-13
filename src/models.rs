@@ -140,11 +140,14 @@ pub fn parse_overview(page: &str) -> Result<Vec<ModelInfo>, String> {
     Ok(models)
 }
 
+/// One comparison-table model column: `(id, context window, effort tiers)`.
+type ComparisonColumn = (String, Option<u32>, Vec<String>);
+
 /// `(id, window, efforts)` for each model column of the first comparison table
 /// that has a `Claude API ID` row, in column order. The same table must carry a
 /// `Default effort` row: its cell decides each model's efforts (see
 /// [`effort_tiers`]).
-fn comparison_models(page: &str) -> Result<Vec<(String, Option<u32>, Vec<String>)>, String> {
+fn comparison_models(page: &str) -> Result<Vec<ComparisonColumn>, String> {
     let tables = markdown_tables(page);
     let Some(table) = tables
         .iter()
@@ -174,7 +177,7 @@ fn comparison_models(page: &str) -> Result<Vec<(String, Option<u32>, Vec<String>
             format!("the models page has no `{DEFAULT_EFFORT_ROW}` row lining up with its models")
         })?;
     let windows = table.iter().find(|row| row_label(row) == Some(WINDOW_ROW));
-    let models: Vec<(String, Option<u32>, Vec<String>)> = ids
+    let models: Vec<ComparisonColumn> = ids
         .iter()
         .enumerate()
         .skip(1) // column 0 is the row label

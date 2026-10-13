@@ -300,6 +300,7 @@ dependencies = [
 [[package]]
 name = "fsearch"
 version = "0.1.0"
+source = "git+https://github.com/vstaln/gray.git?rev=92fb941c0c2cd269b32853b4da8a5f663e284fa5#92fb941c0c2cd269b32853b4da8a5f663e284fa5"
 dependencies = [
  "libc",
  "memchr",
@@ -492,6 +493,7 @@ dependencies = [
 [[package]]
 name = "gray-core"
 version = "0.2.0"
+source = "git+https://github.com/vstaln/gray.git?rev=92fb941c0c2cd269b32853b4da8a5f663e284fa5#92fb941c0c2cd269b32853b4da8a5f663e284fa5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -510,6 +512,7 @@ dependencies = [
 [[package]]
 name = "gray-plugin"
 version = "0.2.0"
+source = "git+https://github.com/vstaln/gray.git?rev=92fb941c0c2cd269b32853b4da8a5f663e284fa5#92fb941c0c2cd269b32853b4da8a5f663e284fa5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -530,6 +533,7 @@ dependencies = [
 [[package]]
 name = "gray-provider"
 version = "0.2.0"
+source = "git+https://github.com/vstaln/gray.git?rev=92fb941c0c2cd269b32853b4da8a5f663e284fa5#92fb941c0c2cd269b32853b4da8a5f663e284fa5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -547,6 +551,7 @@ dependencies = [
 [[package]]
 name = "gray-tools"
 version = "0.2.0"
+source = "git+https://github.com/vstaln/gray.git?rev=92fb941c0c2cd269b32853b4da8a5f663e284fa5#92fb941c0c2cd269b32853b4da8a5f663e284fa5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

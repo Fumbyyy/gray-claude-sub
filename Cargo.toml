@@ -16,8 +16,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 gray-core = { git = "https://github.com/vstaln/gray.git" }
-# Local checkout: carries price_cliff_tokens, which the published rev lacks.
-gray-plugin = { path = "/home/vstaln/gray/crates/gray-plugin" }
+# Pinned rev: remote main lacks price_cliff_tokens; 92fb941c carries it and
+# stays reachable as PR #218's head (and in main after its merge).
+gray-plugin = { git = "https://github.com/vstaln/gray.git", rev = "92fb941c0c2cd269b32853b4da8a5f663e284fa5" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
