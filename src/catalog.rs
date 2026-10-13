@@ -27,6 +27,11 @@ pub struct ModelInfo {
     /// Context window in tokens, from the page's `Context window` row.
     #[serde(default)]
     pub window: Option<u32>,
+    /// Effort tiers the page's `Default effort` row earns this model (the
+    /// tier list is [`crate::models::EFFORTS`]). Empty = the page names no
+    /// effort for it, so the host shows no effort selector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
     /// Prompt tokens above which this model bills a higher price tier, from
     /// the pricing page's `(for prompts over N tokens)` rows. `None` = the
     /// provider declares no cliff.
@@ -246,6 +251,15 @@ pub fn price_cliff_in(model: &str, s: &Snapshot) -> Option<u32> {
 
 pub fn price_cliff(model: &str) -> Option<u32> {
     price_cliff_in(model, &current())
+}
+
+/// The effort tiers a route offers, resolved through canonical ids like
+/// [`context_window_in`], so a `[1m]` route and a family alias carry their
+/// model's tiers. Empty when the page names none for the model.
+pub fn efforts_in(model: &str, s: &Snapshot) -> Vec<String> {
+    s.by_id(canonical_in(model, s))
+        .map(|m| m.efforts.clone())
+        .unwrap_or_default()
 }
 
 /// Native `--model` selection: ids with a 1M window get `[1m]`, 200K ids

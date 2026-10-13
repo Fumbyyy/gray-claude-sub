@@ -40,7 +40,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -150,6 +150,11 @@ pub struct LiveSession {
     /// claude's own session id, from the stream (debug/trace only).
     sid: String,
     pid: u32,
+    /// Re-pooled from a persisted record after a plugin restart — its
+    /// first real turn is the resume's proof: a drain error there means
+    /// a stale record, so the request falls back to a fresh child
+    /// instead of failing.
+    rewarmed: bool,
     /// Frames written this turn, for the `CLAUDE_SUB_DEBUG` dump.
     sent: Vec<Value>,
 }
@@ -1136,12 +1141,56 @@ fn spawn_live(
     tail: &[Value],
     deadline: Instant,
 ) -> Result<(LiveSession, Term, Vec<Value>), String> {
-    let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let sock = mcp::sock_path();
     let (parked_tx, parked_rx) = channel();
     let bridge = Bridge::bind(sock.clone(), parked_tx)
         .map_err(|e| format!("mcp socket {}: {e}", sock.display()))?;
-    let argv = argv(turn, &turn.system, effort, &sock, resume)?;
+    let mut s = spawn_child(turn, tools, effort, resume, &sock, bridge, parked_rx)?;
+    // The bridge is bound before the child spawns; claude's
+    // initialize/tools/list can arrive as soon as it mounts `gray`.
+    s.bridge.set_tools(s.tools.clone());
+    s.seed_auto(&turn.frames);
+    if let Err(e) = s.write_history(tail) {
+        // A dead pipe mid-load is untrusted — but still drain: a refused
+        // resume's error result is worth reading for the tier fallback.
+        let outcome = s.drain(deadline, false);
+        s.close();
+        return match outcome {
+            Ok((_, lines)) => Err(classify(&lines).unwrap_or(e)),
+            Err(_) => Err(e),
+        };
+    }
+    let (term, lines) = match s.drain(deadline, false) {
+        Ok(t) => t,
+        Err(e) => {
+            s.close();
+            return Err(e);
+        }
+    };
+    if let Some(sid) = lines
+        .iter()
+        .find_map(|v| v.get("session_id").and_then(Value::as_str))
+    {
+        session::adopt(sid);
+        s.sid = sid.to_string();
+    }
+    Ok((s, term, lines))
+}
+
+/// Spawn the `claude` child and wire its stdio, stderr tail and bridge —
+/// everything except history loading and the first drain, which differ
+/// between a turn spawn and an idle re-warm spawn.
+fn spawn_child(
+    turn: &PreparedTurn,
+    tools: Vec<Value>,
+    effort: Option<&str>,
+    resume: Option<&ResumePoint>,
+    sock: &std::path::Path,
+    bridge: Bridge,
+    parked_rx: Receiver<String>,
+) -> Result<LiveSession, String> {
+    let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
+    let argv = argv(turn, &turn.system, effort, sock, resume)?;
     let mut child = Command::new(&binary)
         .args(&argv)
         .stdin(Stdio::piped())
@@ -1201,7 +1250,7 @@ fn spawn_live(
         .take()
         .ok_or_else(|| "native stdin unavailable".to_string())?;
     let stdin = Some(stdin);
-    let mut s = LiveSession {
+    Ok(LiveSession {
         child,
         stdin,
         rx,
@@ -1226,36 +1275,95 @@ fn spawn_live(
         sid: String::new(),
         pid,
         sent: Vec::new(),
+        rewarmed: false,
+    })
+}
+
+/// Re-pool one persisted session after a plugin restart: spawn the child
+/// resumed at its recorded point but leave it idle — the transcript
+/// already holds the conversation, so nothing is written to stdin.
+/// The strict-continuation fields are restored from the record so the
+/// next turn matches it like a still-pooled session. `None` when the
+/// resume can't mount — the record then degrades back to a plain
+/// cold-start point for [`spawn_conversation`].
+fn spawn_idle(rec: &session::Record) -> Option<LiveSession> {
+    if !session::session_exists(&rec.sid) {
+        return None;
+    }
+    let sock = mcp::sock_path();
+    let (parked_tx, parked_rx) = channel();
+    let bridge = Bridge::bind(sock.clone(), parked_tx).ok()?;
+    let turn = PreparedTurn {
+        system: rec.system.clone(),
+        frames: Vec::new(),
+        input: Vec::new(),
+        names: Vec::new(),
+        native_model: rec.model.clone(),
     };
-    // The bridge is bound before the child spawns; claude's
-    // initialize/tools/list can arrive as soon as it mounts `gray`.
-    s.bridge.set_tools(s.tools.clone());
-    s.seed_auto(&turn.frames);
-    if let Err(e) = s.write_history(tail) {
-        // A dead pipe mid-load is untrusted — but still drain: a refused
-        // resume's error result is worth reading for the tier fallback.
-        let outcome = s.drain(deadline, false);
+    let point: ResumePoint = (rec.sid.clone(), rec.uuid.clone());
+    let mut s = spawn_child(
+        &turn,
+        Vec::new(),
+        rec.effort.as_deref(),
+        Some(&point),
+        &sock,
+        bridge,
+        parked_rx,
+    )
+    .ok()?;
+    // A mounted child announces `system/init` then idles on stdin; a
+    // refused resume or a dead spawn surfaces as an early result/EOF —
+    // nothing pooled, nothing poisoned.
+    let ok = matches!(
+        s.rx.recv_timeout(Duration::from_secs(30)),
+        Ok(OutEv::Line(ref v)) if v.get("type").and_then(Value::as_str) == Some("system")
+    );
+    if !ok {
         s.close();
-        return match outcome {
-            Ok((_, lines)) => Err(classify(&lines).unwrap_or(e)),
-            Err(_) => Err(e),
-        };
+        return None;
     }
-    let (term, lines) = match s.drain(deadline, false) {
-        Ok(t) => t,
-        Err(e) => {
-            s.close();
-            return Err(e);
+    s.absorbed = rec.absorbed.clone();
+    s.reply_call_ids = rec.reply_call_ids.clone();
+    s.reply_text = rec.reply_text.clone();
+    s.sid = rec.sid.clone();
+    s.rewarmed = true;
+    // Restore the idle clocks from the record's age: the warm window and
+    // refresh cadence keep their true position across the restart.
+    let age = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(rec.saved_at);
+    let ago = Instant::now().checked_sub(Duration::from_secs(age));
+    s.last_used = ago.unwrap_or_else(Instant::now);
+    s.last_contact = ago;
+    Some(s)
+}
+
+/// Re-pool sessions whose records are still inside the warm window. A
+/// plugin restart used to strand them: the pool died with the process
+/// and each session's ~1h upstream cache entry lapsed before its next
+/// turn, so a restart re-billed every warm conversation. Spawned idle
+/// here, the resumed children rejoin the keepalive cycle and their
+/// cache entries renew on schedule. Runs once at startup; spawn
+/// failures stay silent — the record remains a cold-start point.
+pub fn rewarm() {
+    let mut warmed: Vec<LiveSession> = Vec::new();
+    for (rec, age) in session::records() {
+        if warmed.len() >= MAX_LIVE || age > crate::keepalive::WARM_WINDOW {
+            break;
         }
-    };
-    if let Some(sid) = lines
-        .iter()
-        .find_map(|v| v.get("session_id").and_then(Value::as_str))
-    {
-        session::adopt(sid);
-        s.sid = sid.to_string();
+        // A legacy two-line point carries no continuation state.
+        if rec.absorbed.is_empty() {
+            continue;
+        }
+        if let Some(s) = spawn_idle(&rec) {
+            warmed.push(s);
+        }
     }
-    Ok((s, term, lines))
+    if !warmed.is_empty() {
+        locked_pool().live.extend(warmed);
+    }
 }
 
 /// Classify a finished drain for the caller: `None` = answered, else the
@@ -1331,7 +1439,12 @@ fn spawn_live_retried(
 /// Record where this conversation now lives (the session plus the
 /// transcript uuid of its last assistant line) so a future cold start
 /// resumes instead of replaying.
-fn record_point(turn: &PreparedTurn, lines: &[Value]) {
+/// Persist the resume point for the conversation through this turn —
+/// keyed on the frames the next turn's `resume_key` hashes — plus the
+/// continuation state a restarted process needs to re-pool the session
+/// ([`session::Record`]). `s` has just absorbed this turn, so its
+/// fields are exactly what `continuation` will verify next.
+fn record_point(turn: &PreparedTurn, s: &LiveSession, lines: &[Value]) {
     if let Some((sid, uuid)) = chat::resume_point(lines)
         && session::prune_native_tool_results(&sid)
     {
@@ -1342,7 +1455,23 @@ fn record_point(turn: &PreparedTurn, lines: &[Value]) {
                 .filter(|v| v.get("type").and_then(Value::as_str) == Some("assistant"))
                 .map(|v| json!({"type": "assistant", "message": v["message"].clone()})),
         );
-        session::save(chat::resume_key(turn, &turn.system, &convo), &sid, &uuid);
+        session::save_record(
+            chat::resume_key(turn, &turn.system, &convo),
+            &session::Record {
+                sid,
+                uuid,
+                system: turn.system.clone(),
+                model: turn.native_model.clone(),
+                effort: s.effort.clone(),
+                absorbed: s.absorbed.clone(),
+                reply_call_ids: s.reply_call_ids.clone(),
+                reply_text: s.reply_text.clone(),
+                saved_at: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            },
+        );
     }
 }
 
@@ -1486,6 +1615,14 @@ pub fn run_turn(
                     &json!({"mode": mode, "pid": s.pid, "sid": s.sid, "error": e}),
                 );
             }
+            if s.rewarmed {
+                // First drain on a re-pooled child proves the resume:
+                // a dead wire here means a stale record, not a turn
+                // failure — the request is still answerable fresh.
+                s.close();
+                let (s2, t2, l2) = spawn_conversation(&turn, tools, effort, deadline)?;
+                return finish_spawn(s2, t2, l2, &turn, "fresh:rewarm_dead");
+            }
             if s.settle(&e) {
                 give_back(s);
             }
@@ -1515,8 +1652,8 @@ pub fn run_turn(
         give_back(s);
         return Err(e);
     }
-    record_point(&turn, &lines);
     s.absorb(&turn, &lines, applied_to);
+    record_point(&turn, &s, &lines);
     give_back(s);
     Ok(lines)
 }
@@ -1555,8 +1692,8 @@ fn finish_spawn(
                 }
                 return Err(e);
             }
-            record_point(turn, &lines);
             s.absorb(turn, &lines, turn.input.len());
+            record_point(turn, &s, &lines);
             give_back(s);
             Ok(lines)
         }

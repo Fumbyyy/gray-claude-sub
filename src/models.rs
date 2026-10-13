@@ -29,6 +29,14 @@ const API_ID_ROW: &str = "Claude API ID";
 const WINDOW_ROW: &str = "Context window";
 /// The line that opens the legacy-model links.
 const LEGACY_LINE: &str = "Legacy models (still available):";
+/// Row label of the table row that holds each current model's default effort.
+/// The page names no effort levels anywhere, so this row is the only per-model
+/// evidence that a model takes effort at all.
+const DEFAULT_EFFORT_ROW: &str = "Default effort";
+/// Effort tiers native `--effort` accepts (gray's `off` = flag omitted). The
+/// page names no levels, so a model whose `Default effort` cell names a tier
+/// offers all of them, as the pinned builds always did.
+pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// Render a snapshot as the protocol catalog. Pure — tests drive it with
 /// synthetic snapshots, never the network.
@@ -41,9 +49,10 @@ pub fn catalog_from(s: &Snapshot) -> ProviderModelCatalog {
             // The pricing page's `(for prompts over N tokens)` row for this
             // model, when it has one; the host compacts under that cliff.
             price_cliff_tokens: catalog::price_cliff_in(&id, s),
-            // The page states no effort levels, so none is offered: the host
-            // reads an empty list as "no reasoning control".
-            reasoning_efforts: Vec::new(),
+            // The tiers the page's `Default effort` cell earns this model. An
+            // empty list is "no reasoning control" to the host, so it is only
+            // ever empty for a model the page says nothing about.
+            reasoning_efforts: catalog::efforts_in(&id, s),
             variants: Vec::new(),
             slots: Vec::new(),
             id,
@@ -111,9 +120,10 @@ pub(crate) async fn fetch_page(url: &str, what: &str) -> Result<String, String> 
 pub fn parse_overview(page: &str) -> Result<Vec<ModelInfo>, String> {
     let mut models: Vec<ModelInfo> = comparison_models(page)?
         .into_iter()
-        .map(|(id, window)| ModelInfo {
+        .map(|(id, window, efforts)| ModelInfo {
             id,
             window,
+            efforts,
             price_cliff: None,
         })
         .collect();
@@ -122,6 +132,7 @@ pub fn parse_overview(page: &str) -> Result<Vec<ModelInfo>, String> {
             models.push(ModelInfo {
                 id,
                 window: None,
+                efforts: Vec::new(),
                 price_cliff: None,
             });
         }
@@ -129,9 +140,11 @@ pub fn parse_overview(page: &str) -> Result<Vec<ModelInfo>, String> {
     Ok(models)
 }
 
-/// `(id, window)` for each model column of the first comparison table that
-/// has a `Claude API ID` row, in column order.
-fn comparison_models(page: &str) -> Result<Vec<(String, Option<u32>)>, String> {
+/// `(id, window, efforts)` for each model column of the first comparison table
+/// that has a `Claude API ID` row, in column order. The same table must carry a
+/// `Default effort` row: its cell decides each model's efforts (see
+/// [`effort_tiers`]).
+fn comparison_models(page: &str) -> Result<Vec<(String, Option<u32>, Vec<String>)>, String> {
     let tables = markdown_tables(page);
     let Some(table) = tables
         .iter()
@@ -150,8 +163,18 @@ fn comparison_models(page: &str) -> Result<Vec<(String, Option<u32>)>, String> {
         .iter()
         .find(|row| row_label(row) == Some(API_ID_ROW))
         .expect("table was found by its API-id row");
+    // A page without the effort row is an error, never "no effort": dropping
+    // the row would otherwise silently remove every model's effort selector.
+    // A row of another shape can't be trusted column-for-column.
+    let defaults = table
+        .iter()
+        .find(|row| row_label(row) == Some(DEFAULT_EFFORT_ROW))
+        .filter(|row| row.len() == ids.len())
+        .ok_or_else(|| {
+            format!("the models page has no `{DEFAULT_EFFORT_ROW}` row lining up with its models")
+        })?;
     let windows = table.iter().find(|row| row_label(row) == Some(WINDOW_ROW));
-    let models: Vec<(String, Option<u32>)> = ids
+    let models: Vec<(String, Option<u32>, Vec<String>)> = ids
         .iter()
         .enumerate()
         .skip(1) // column 0 is the row label
@@ -163,7 +186,8 @@ fn comparison_models(page: &str) -> Result<Vec<(String, Option<u32>)>, String> {
                     let window = windows
                         .filter(|w| w.len() == ids.len())
                         .and_then(|w| window_tokens(w[col]));
-                    Ok(Some((id.to_string(), window)))
+                    let efforts = effort_tiers(defaults[col])?;
+                    Ok(Some((id.to_string(), window, efforts)))
                 }
                 // A cell that opens a backtick and never closes is torn
                 // data (``claude-son`), not a model column to skip.
@@ -181,6 +205,20 @@ fn comparison_models(page: &str) -> Result<Vec<(String, Option<u32>)>, String> {
         return Err(format!("the `{API_ID_ROW}` row lists no model ids"));
     }
     Ok(models)
+}
+
+/// The effort tiers a model's `Default effort` cell earns it: all of
+/// [`EFFORTS`] when the cell names a default tier (a backticked value such as
+/// `` `high` ``), none for a cell that doesn't (`—`). A torn cell, a backtick
+/// opened and never closed, is an error.
+fn effort_tiers(cell: &str) -> Result<Vec<String>, String> {
+    match (backticked(cell), cell.contains('`')) {
+        (Some(_), _) => Ok(EFFORTS.iter().map(|e| e.to_string()).collect()),
+        (None, true) => Err(format!(
+            "the `{DEFAULT_EFFORT_ROW}` row holds an unterminated cell"
+        )),
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// The page's markdown tables: each a run of consecutive `|` lines, split

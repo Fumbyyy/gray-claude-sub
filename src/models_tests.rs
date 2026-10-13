@@ -55,6 +55,14 @@ fn default_url_is_the_public_page_and_the_override_wins() {
 #[test]
 fn parses_the_saved_page() {
     let models = parse_overview(PAGE).unwrap();
+    // Every current column's `Default effort` cell names a tier, so each takes
+    // all of them; the legacy models the page only links to state none.
+    for m in &models[..4] {
+        assert_eq!(m.efforts, EFFORTS, "{}", m.id);
+    }
+    for m in &models[4..] {
+        assert!(m.efforts.is_empty(), "{}", m.id);
+    }
     assert_eq!(
         pairs(&models),
         vec![
@@ -80,6 +88,17 @@ fn parses_the_saved_page() {
 fn malformed_pages_are_errors_not_short_lists() {
     // Not the overview at all: an error page, or nothing.
     assert!(parse_overview("").is_err());
+    // The same table without its `Default effort` row: an error, never a
+    // silent "no effort" for every model.
+    let no_effort_row = PAGE
+        .lines()
+        .filter(|l| !l.starts_with("| [Default effort]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(parse_overview(&no_effort_row).is_err());
+    // A torn `Default effort` cell is an error too, not "no effort".
+    let torn = PAGE.replacen("`high`", "`hi", 1);
+    assert!(parse_overview(&torn).is_err());
     assert!(parse_overview("<html><body>Service unavailable</body></html>").is_err());
     // A truncated download, cut before the API id row.
     let cut = PAGE.find("Claude API ID").unwrap();
@@ -139,18 +158,23 @@ fn window_cells_read_as_tokens_or_unknown() {
 fn window_row_of_another_shape_is_not_trusted() {
     let page = "| Feature | A | B |\n\
                 | Claude API ID | `claude-x-1` | `claude-x-2` |\n\
+                | Default effort | `high` | — |\n\
                 | [Context window](https://example.com/w) | 1M tokens | 200k tokens | extra |\n";
     let got = parse_overview(page).unwrap();
     assert_eq!(
         pairs(&got),
         vec![("claude-x-1", None), ("claude-x-2", None)]
     );
+    // The dash cell names no default tier: that column takes no effort.
+    assert_eq!(got[0].efforts.len(), EFFORTS.len());
+    assert!(got[1].efforts.is_empty());
 }
 
 #[test]
 fn legacy_links_dedupe_and_skip_other_links() {
     let page = "| Feature | A |\n\
                 | Claude API ID | `claude-x-1` |\n\
+                | Default effort | `medium` |\n\
                 | [Context window](https://example.com/w) | 1M tokens |\n\
                 \n\
                 Legacy models (still available): [X 1](https://platform.claude.com/docs/en/models/x-1/overview), \
@@ -162,19 +186,23 @@ fn legacy_links_dedupe_and_skip_other_links() {
         pairs(&got),
         vec![("claude-x-1", Some(1_000_000)), ("claude-x-0", None)]
     );
+    assert_eq!(got[0].efforts, EFFORTS);
+    assert!(got[1].efforts.is_empty());
 }
 
 #[test]
-fn catalog_lists_routes_with_windows_and_no_efforts() {
+fn catalog_lists_routes_with_windows_and_their_efforts() {
     let s = Snapshot::new(vec![
         ModelInfo {
             id: "claude-sonnet-9-9".into(),
             window: Some(1_000_000),
+            efforts: EFFORTS.iter().map(|e| e.to_string()).collect(),
             price_cliff: None,
         },
         ModelInfo {
             id: "claude-haiku-9-9".into(),
             window: Some(200_000),
+            efforts: Vec::new(),
             price_cliff: Some(100_000),
         },
     ]);
@@ -193,8 +221,16 @@ fn catalog_lists_routes_with_windows_and_no_efforts() {
         .expect("haiku in catalog");
     assert_eq!(haiku.context_window, Some(200_000));
     assert!(got.models.iter().any(|m| m.id == "claude-sonnet-9-9[1m]"));
-    // The page states no effort levels, so no model offers any.
-    assert!(got.models.iter().all(|m| m.reasoning_efforts.is_empty()));
+    // A route carries its model's tiers; a model the page names none for
+    // offers none, and a `[1m]` route inherits its model's tiers.
+    assert_eq!(sonnet.reasoning_efforts, EFFORTS);
+    assert_eq!(haiku.reasoning_efforts, Vec::<String>::new());
+    let sonnet_1m = got
+        .models
+        .iter()
+        .find(|m| m.id == "claude-sonnet-9-9[1m]")
+        .expect("1M route in catalog");
+    assert_eq!(sonnet_1m.reasoning_efforts, EFFORTS);
 }
 
 #[tokio::test]

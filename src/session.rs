@@ -322,9 +322,109 @@ fn resume_file(key: u64) -> PathBuf {
     cache_root().join("resume").join(format!("{key:016x}"))
 }
 
+/// A persisted pool entry: the resume point plus the continuation state
+/// a restarted plugin needs to re-warm the session into the pool (see
+/// [`crate::live::rewarm`]) instead of letting its upstream cache entry
+/// lapse. Legacy files are two lines (`<sid>\n<uuid>`) — they still
+/// resume but carry no continuation state, so they can't re-warm.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct Record {
+    pub sid: String,
+    pub uuid: String,
+    #[serde(default)]
+    pub system: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// The request `input` array the session had absorbed at save time
+    /// — the strict-continuation prefix the next turn must extend.
+    #[serde(default)]
+    pub absorbed: Vec<Value>,
+    /// Call ids and text of the session's last answer — the echo zone
+    /// the next turn replays and `continuation` verifies.
+    #[serde(default)]
+    pub reply_call_ids: Vec<String>,
+    #[serde(default)]
+    pub reply_text: String,
+    /// Unix seconds when written; restores the warm-window clock.
+    #[serde(default)]
+    pub saved_at: u64,
+}
+
+fn record_of(text: &str) -> Option<Record> {
+    let r = if let Ok(r) = serde_json::from_str::<Record>(text) {
+        r
+    } else {
+        let (sid, uuid) = parse_point(text)?;
+        Record {
+            sid,
+            uuid,
+            ..Default::default()
+        }
+    };
+    (is_uuid(&r.sid) && is_uuid(&r.uuid)).then_some(r)
+}
+
 /// The resume point recorded for conversation `key`, if any and well-formed.
 pub fn lookup(key: u64) -> Option<ResumePoint> {
-    parse_point(&std::fs::read_to_string(resume_file(key)).ok()?)
+    let text = std::fs::read_to_string(resume_file(key)).ok()?;
+    record_of(&text).map(|r| (r.sid, r.uuid))
+}
+
+/// The full record for `key`, if the file parses — legacy points fill
+/// only `sid`/`uuid` (resumable, not rewammable).
+#[allow(dead_code)]
+pub fn load(key: u64) -> Option<Record> {
+    record_of(&std::fs::read_to_string(resume_file(key)).ok()?)
+}
+
+/// Every stored record with its file age, freshest first. Rewarm scans
+/// these at startup; stale or unreadable files are skipped — worst case
+/// a conversation falls back to the plain cold-start tiers.
+pub fn records() -> Vec<(Record, Duration)> {
+    let dir = cache_root().join("resume");
+    let now = SystemTime::now();
+    let mut out: Vec<(Record, Duration)> = Vec::new();
+    for p in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let Ok(text) = std::fs::read_to_string(p.path()) else {
+            continue;
+        };
+        let Some(rec) = record_of(&text) else {
+            continue;
+        };
+        let age = p
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or(Duration::MAX);
+        out.push((rec, age));
+    }
+    out.sort_by_key(|(_, age)| *age);
+    out
+}
+
+/// Write the full pool record for `key` — resume point + continuation
+/// state — so a plugin restart can re-warm the session, and sweep idle
+/// leftovers. Same durability rules as [`save`]: atomic, best-effort.
+pub fn save_record(key: u64, rec: &Record) {
+    if !(is_uuid(&rec.sid) && is_uuid(&rec.uuid)) {
+        return;
+    }
+    if let Ok(text) = serde_json::to_string(rec) {
+        let _ = write_atomic(&resume_file(key), text.as_bytes());
+        touch_ledger(&rec.sid);
+        if let Some(projects) = projects_root() {
+            sweep_if_due(&cache_root(), &projects, SystemTime::now());
+        }
+    }
+}
+
+/// Whether the CLI's transcript for `sid` is still on disk — a record
+/// whose transcript was swept can't resume, so rewarm skips it.
+pub fn session_exists(sid: &str) -> bool {
+    is_uuid(sid) && session_file(sid).is_some_and(|p| p.exists())
 }
 
 /// Parse a resume file: `<sid>\n<uuid>\n`, both canonical uuids.

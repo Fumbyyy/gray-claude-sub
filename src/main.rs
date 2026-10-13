@@ -73,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     // Re-warm live sessions before their ~1h prompt-cache entry lapses.
     keepalive::start();
+    // Re-pool sessions persisted before a restart so their upstream
+    // cache entries renew instead of lapsing — best-effort, background.
+    std::thread::spawn(live::rewarm);
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
     let mut stdout = std::io::stdout();
