@@ -170,6 +170,14 @@ fn accept(listener: &Listener) -> std::io::Result<Stream> {
         Listener::Unix(l) => Ok(Stream::Unix(l.accept()?.0)),
         Listener::Tcp { inner, token } => {
             let (mut s, _) = inner.accept()?;
+            // The listener is nonblocking so the accept loop can poll for
+            // shutdown, and on Windows the accepted socket inherits that
+            // (unix accepted sockets do not). Left nonblocking, every read
+            // past the buffered bytes fails WouldBlock, so the conn dies
+            // right after its first reply -- claude's `server/discover`
+            // probe -- and the mount never lands: no tools, and the client
+            // re-probes every 30s until the turn times out.
+            s.set_nonblocking(false)?;
             s.set_read_timeout(Some(Duration::from_secs(10)))?;
             let mut want = token.clone();
             want.push('\n');
