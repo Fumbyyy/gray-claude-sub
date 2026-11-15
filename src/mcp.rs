@@ -164,27 +164,25 @@ fn listen() -> std::io::Result<(Listener, String, Option<PathBuf>)> {
 /// Accept one connection. On TCP the client's first line must be the
 /// listener token; anything else fails `PermissionDenied` and the accept
 /// loop keeps going instead of dying on a stray probe.
+///
+/// Every accepted socket is put back in blocking mode. The listener is
+/// nonblocking so the accept loop can poll for shutdown, and Windows and
+/// BSD/macOS propagate that flag into the accepted socket (Linux does
+/// not). Left inherited, every read past the bytes already buffered fails
+/// `WouldBlock` and the conn dies right after its first reply — claude's
+/// `server/discover` probe — so `initialize` and `tools/list` never
+/// arrive, the mount never lands, and the client re-probes every 30s
+/// until the turn times out.
 fn accept(listener: &Listener) -> std::io::Result<Stream> {
     match listener {
         #[cfg(unix)]
         Listener::Unix(l) => {
             let (s, _) = l.accept()?;
-            // BSD and macOS inherit the listener's nonblocking flag into the
-            // accepted socket, exactly as Windows does (Linux does not), so
-            // the same reset is needed here or the conn dies right after its
-            // first reply.
             s.set_nonblocking(false)?;
             Ok(Stream::Unix(s))
         }
         Listener::Tcp { inner, token } => {
             let (mut s, _) = inner.accept()?;
-            // The listener is nonblocking so the accept loop can poll for
-            // shutdown, and on Windows the accepted socket inherits that.
-            // Left nonblocking, every read
-            // past the buffered bytes fails WouldBlock, the conn dies right
-            // after the first reply — claude's `server/discover` probe — and
-            // the mount never lands: no tools, and the client re-probes
-            // every 30s until the turn times out.
             s.set_nonblocking(false)?;
             s.set_read_timeout(Some(Duration::from_secs(10)))?;
             let mut want = token.clone();
