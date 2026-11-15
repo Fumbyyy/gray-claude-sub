@@ -39,6 +39,19 @@ fn arm_read_timeout(s: &Stream) {
     }
 }
 
+/// Wait for a condition the bridge reaches asynchronously, instead of
+/// sleeping a fixed time and hoping the scheduler cooperated.
+fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {what}");
+}
+
 /// One request/response round trip.
 fn call(write: &mut Stream, read: &mut BufReader<Stream>, msg: Value) -> Value {
     write
@@ -113,7 +126,13 @@ fn the_window_is_what_ends_a_mount_that_never_comes_back() {
     initialize(&mut w, &mut r, json!(1));
     drop(r);
     drop(w);
-    std::thread::sleep(Duration::from_millis(250));
+    wait_for("the session conn to be reported gone", || {
+        b.shared
+            .state
+            .lock()
+            .map(|st| st.session_gone_since.is_some())
+            .unwrap_or(false)
+    });
 
     let st = b.shared.state.lock().unwrap();
     assert!(
@@ -174,9 +193,24 @@ fn a_conn_superseded_by_a_newer_transport_cannot_arm_the_window() {
     let (mut wb, mut rb) = client(b.endpoint());
     initialize(&mut wb, &mut rb, json!(2));
 
+    // The live transport still serves.
+    let served = call(
+        &mut wb,
+        &mut rb,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+    );
+    assert_eq!(
+        served["id"],
+        json!(3),
+        "the newer transport owns the session"
+    );
+
+    // Now the superseded conn's read loop ends and reports the loss, exactly
+    // as `serve_conn` does on EOF. Driven directly so the assertion cannot
+    // race the scheduler.
     drop(ra);
     drop(wa);
-    std::thread::sleep(Duration::from_millis(250));
+    b.shared.conn_lost(Some(1));
 
     let st = b.shared.state.lock().unwrap();
     assert!(
