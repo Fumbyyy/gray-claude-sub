@@ -8,7 +8,6 @@
 use super::*;
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
@@ -17,25 +16,31 @@ fn bridge() -> Bridge {
     Bridge::bind(tx).expect("bind the bridge")
 }
 
-/// Connect and send the token line, exactly as `claude-sub mcp <endpoint>`
-/// does before its stdio pump starts.
-fn client(endpoint: &str) -> (TcpStream, BufReader<TcpStream>) {
-    let rest = endpoint.strip_prefix("tcp:").expect("tcp endpoint");
-    let (port, token) = rest.split_once(':').expect("port:token endpoint");
-    let mut write = TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap()))
-        .expect("connect to the bridge");
-    write
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("read timeout");
-    write.write_all(token.as_bytes()).expect("token");
-    write.write_all(b"\n").expect("token line");
-    write.flush().expect("flush token");
+/// Connect exactly as `claude-sub mcp <endpoint>` does — TCP plus the token
+/// line on Windows, a unix socket elsewhere — and return both halves.
+fn client(endpoint: &str) -> (Stream, BufReader<Stream>) {
+    let write = connect(endpoint).expect("connect to the bridge");
+    arm_read_timeout(&write);
     let read = write.try_clone().expect("clone");
     (write, BufReader::new(read))
 }
 
+/// A hung test is worse than a failed one: cap every read.
+fn arm_read_timeout(s: &Stream) {
+    let d = Some(Duration::from_secs(10));
+    match s {
+        #[cfg(unix)]
+        Stream::Unix(s) => {
+            let _ = s.set_read_timeout(d);
+        }
+        Stream::Tcp(s) => {
+            let _ = s.set_read_timeout(d);
+        }
+    }
+}
+
 /// One request/response round trip.
-fn call(write: &mut TcpStream, read: &mut BufReader<TcpStream>, msg: Value) -> Value {
+fn call(write: &mut Stream, read: &mut BufReader<Stream>, msg: Value) -> Value {
     write
         .write_all(format!("{msg}\n").as_bytes())
         .expect("write request");
@@ -46,7 +51,7 @@ fn call(write: &mut TcpStream, read: &mut BufReader<TcpStream>, msg: Value) -> V
 }
 
 /// `initialize` — what makes a conn the session transport.
-fn initialize(write: &mut TcpStream, read: &mut BufReader<TcpStream>, id: Value) -> Value {
+fn initialize(write: &mut Stream, read: &mut BufReader<Stream>, id: Value) -> Value {
     call(
         write,
         read,
@@ -54,6 +59,80 @@ fn initialize(write: &mut TcpStream, read: &mut BufReader<TcpStream>, id: Value)
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                 "clientInfo": {"name": "claude-code", "version": "2.1.309"}}}),
     )
+}
+
+#[test]
+fn a_reconnected_transport_is_served() {
+    let b = bridge();
+
+    // First transport: it speaks, so it claims the write half — then the
+    // client drops it, the way a mount timeout or a respawn does.
+    let (mut w1, mut r1) = client(b.endpoint());
+    let first = initialize(&mut w1, &mut r1, json!(1));
+    assert_eq!(first["id"], json!(1), "the first transport is served");
+    drop(r1);
+    drop(w1);
+
+    // Let the accept loop and the read loop see the close.
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        !b.is_dead(),
+        "a closed conn is a reconnect window, not the end of the mount"
+    );
+
+    // The respawned shim connects to the same endpoint and has to be
+    // served — this is the connection a real mount failure never got.
+    let (mut w2, mut r2) = client(b.endpoint());
+    let second = initialize(&mut w2, &mut r2, json!(2));
+    assert_eq!(second["id"], json!(2), "the reopened transport is served");
+}
+
+#[test]
+fn a_probe_conn_that_never_speaks_does_not_arm_the_window() {
+    let b = bridge();
+    let (mut w, mut r) = client(b.endpoint());
+    let probe = call(
+        &mut w,
+        &mut r,
+        json!({"jsonrpc": "2.0", "id": "p1", "method": "server/discover"}),
+    );
+    assert_eq!(probe["id"], json!("p1"), "discover is answered");
+    drop(r);
+    drop(w);
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        !b.is_dead(),
+        "probe conns are disposable and never end the mount"
+    );
+}
+
+#[test]
+fn the_window_is_what_ends_a_mount_that_never_comes_back() {
+    let b = bridge();
+    let (mut w, mut r) = client(b.endpoint());
+    initialize(&mut w, &mut r, json!(1));
+    drop(r);
+    drop(w);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let st = b.shared.state.lock().unwrap();
+    assert!(
+        !st.lost_within(RECONNECT_GRACE),
+        "inside the grace the mount is still reconnectable"
+    );
+    assert!(
+        st.lost_within(Duration::ZERO),
+        "past the grace a silent mount is a lost mount"
+    );
+}
+
+#[test]
+fn closing_the_bridge_ends_it_at_once() {
+    let mut b = bridge();
+    let (mut w, mut r) = client(b.endpoint());
+    initialize(&mut w, &mut r, json!(1));
+    b.close();
+    assert!(b.is_dead(), "an explicit close is not a reconnect window");
 }
 
 #[test]
@@ -80,5 +159,28 @@ fn a_conn_keeps_serving_after_its_first_request() {
         second["id"],
         json!(2),
         "the same conn keeps reading after its first request"
+    );
+}
+
+#[test]
+fn a_conn_superseded_by_a_newer_transport_cannot_arm_the_window() {
+    // Claude's respawn can claim the transport before the old conn's EOF is
+    // processed. That conn's death then says nothing about the mount: the
+    // live transport is the new one.
+    let b = bridge();
+    let (mut wa, mut ra) = client(b.endpoint());
+    initialize(&mut wa, &mut ra, json!(1));
+
+    let (mut wb, mut rb) = client(b.endpoint());
+    initialize(&mut wb, &mut rb, json!(2));
+
+    drop(ra);
+    drop(wa);
+    std::thread::sleep(Duration::from_millis(250));
+
+    let st = b.shared.state.lock().unwrap();
+    assert!(
+        !st.lost_within(Duration::ZERO),
+        "the conn that died was not the transport any more"
     );
 }
