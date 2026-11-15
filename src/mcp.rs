@@ -167,12 +167,20 @@ fn listen() -> std::io::Result<(Listener, String, Option<PathBuf>)> {
 fn accept(listener: &Listener) -> std::io::Result<Stream> {
     match listener {
         #[cfg(unix)]
-        Listener::Unix(l) => Ok(Stream::Unix(l.accept()?.0)),
+        Listener::Unix(l) => {
+            let (s, _) = l.accept()?;
+            // BSD and macOS inherit the listener's nonblocking flag into the
+            // accepted socket, exactly as Windows does (Linux does not), so
+            // the same reset is needed here or the conn dies right after its
+            // first reply.
+            s.set_nonblocking(false)?;
+            Ok(Stream::Unix(s))
+        }
         Listener::Tcp { inner, token } => {
             let (mut s, _) = inner.accept()?;
             // The listener is nonblocking so the accept loop can poll for
-            // shutdown, and on Windows the accepted socket inherits that
-            // (unix accepted sockets do not). Left nonblocking, every read
+            // shutdown, and on Windows the accepted socket inherits that.
+            // Left nonblocking, every read
             // past the buffered bytes fails WouldBlock, the conn dies right
             // after the first reply — claude's `server/discover` probe — and
             // the mount never lands: no tools, and the client re-probes
