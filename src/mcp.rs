@@ -555,13 +555,30 @@ fn serve_conn(conn: Stream, shared: &Arc<Shared>, arrivals: &Sender<String>) {
                         {"name": "gray", "version": "1"}},
                 }}),
             ),
-            // Modern-era change subscription the client opens right after
-            // discovery. Accept it silently — we still push
-            // tools/list_changed through the normal notification path.
-            Some("subscriptions/listen") => reply(
-                &mut writer,
-                &json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-            ),
+            // Modern-era change subscription: a long-lived request the
+            // client holds open for the life of the mount. It is acked by
+            // `notifications/subscriptions/acknowledged` (keyed by the
+            // request id via _meta.subscriptionId) and stays pending.
+            // Completing it with a result reads as "subscription closed
+            // before acknowledging" and makes the client churn reopen
+            // attempts: measured on claude 2.1.309, one turn opens the
+            // subscription 10 times when it is completed, 3 when it is
+            // acked.
+            Some("subscriptions/listen") => {
+                let filter = v
+                    .pointer("/params/notifications")
+                    .cloned()
+                    .unwrap_or(json!({}));
+                reply(
+                    &mut writer,
+                    &json!({"jsonrpc": "2.0",
+                        "method": "notifications/subscriptions/acknowledged",
+                        "params": {
+                            "_meta": {"io.modelcontextprotocol/subscriptionId": id},
+                            "notifications": filter,
+                        }}),
+                )
+            }
             Some("initialize") => {
                 // Echo the client's protocol version verbatim.
                 let pv = v
